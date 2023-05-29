@@ -1,217 +1,160 @@
-import sys
-import pandas as pd
-import numpy as np
-from itertools import product 
-
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.naive_bayes import GaussianNB
-
-from sklearn.model_selection import StratifiedKFold, cross_validate
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
-
-
-
-def read_Fasta (filename):
-    """
-    Read the sequences from fasta files. 
-    Return the data as a dictionary where the id of the sequence is the key and the sequence is the value.
-    """
-
-    from re import sub, search
-
-    dic={}
-    sequence = None
-    id = None
-    
-    fh = open(filename)
-
-    for line in fh:
-        if search(">.*", line):
-                if sequence is not None and id is not None and sequence != "":
-                    dic[id]=sequence
-                id = search("(?<=\|)[^|]+", line).group(0)  # Extract ID between '|' characters             
-                sequence = ""
+# retrives both files and k from the console arguments # 
+def parseArguments(arguments):
+    for index in range(1, len(arguments), 2):
+        if   arguments[index] == "-a": # first  file
+            fileA = arguments[index+1]
+        elif arguments[index] == "-b": # second file
+            fileB = arguments[index+1]
+        elif arguments[index] == "-k": # k-mers
+            k = int(arguments[index+1])
         else:
-            if sequence is None: return None
-            else: sequence += sub("\s","",line)
+            raise Exception(f"{arguments[index]} is not a valid argument") 
+    return (fileA, fileB, k)
 
-    if sequence is not None and id is not None and sequence != "":
-                    dic[id]=sequence
+# extracts the rough data from a fasta file # 
+def read_fasta(filename):
+    file = open(filename, 'r')
+    data = file.read()
+    file.close()
+    return data
 
-    fh.close()
+# extracts the mapping (id:sequence) from a fasta file #
+def extract_map(filename):
+    from re import findall
+    data = read_fasta(filename)
+    identifiers = findall(">sp\|[^\|]*\|", data)
+    sequences   = findall("\n[^>]*>",  data+">")                # data + ">" allows to capture the last sequence
+    if len(identifiers) != len(sequences):
+        raise Exception("#identifiers != #sequences")
+    identifiers_map = {}
+    for index in range(len(identifiers)):
+        identifier = identifiers[index][4:-1]                   # strips ">sp||" from the identifier
+        sequence   = sequences[index][1:-2].replace("\n","")    # strips "\n\n>" from the sequence and erases the '\n' between lines
+        identifiers_map[identifier] = sequence
+    return identifiers_map
 
-    return dic
+# gets all kmer's permutations # 
+def get_all_kmers(k=2):
+    from itertools import product 
+    kmers    = []
+    alphabet = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','S','T','W','Y','V']
+    permutations = list(product(alphabet,repeat=k))
+    for kmer in permutations:
+        kmer = "".join(kmer)    # casts the kmer to a clean string | string() does not have the intended outcome here
+        kmers.append(kmer)
+    return kmers
 
-
-def word_to_kmer(k):
-
-    result = []
-    alphabet  = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V']
-
-    kmers = list(product(alphabet,repeat=k))
-    for kmer in kmers:
-        kmer = "".join(kmer)
-        result.append(kmer)
-
-    return result
-
-
-def generate_kmers(seq, k):
-    """
-    Given a sequence returns a dictionary that contains the frequency of each k-mer in the sequence.
-    Normalize the frequency by the total number of 2-mers in the sequence Fi,j = Ci,j /|2-mers|
-    """
-
-    kmer_freq={}
-    kmer_n=len(seq)-k+1
-
-    for i in range(kmer_n):
-        kmer=seq[i:i+k]
-
-        if kmer in kmer_freq:
-            kmer_freq[kmer]+=1
+# gets the normalized frequency of each kmer in the sequence # 
+def get_kmers_frequency(sequence, k=2):
+    kmers_frequency = {}
+    number_kmers = len(sequence) - k + 1        # number of possible kmers in the sequence
+    for index in range(number_kmers):
+        kmer = sequence[index:index+k]
+        if kmer in kmers_frequency:
+            kmers_frequency[kmer] += 1
         else:
-            kmer_freq[kmer]=1
+            kmers_frequency[kmer]  = 1
+    for kmer in kmers_frequency:
+        kmers_frequency[kmer] /= number_kmers   # normalizes the frequency by the number of kmers
+    return kmers_frequency
 
-    for k in kmer_freq:
-        kmer_freq[k]=kmer_freq[k]/kmer_n
+# used in generate_FFP_dataframes(...) and classification #
+import pandas
 
-    return kmer_freq
+# creates and fills a pandas dataframe with the FFP values for all the sequences #
+#                     columns = 400 Fi,j dinucleotide values                     #
+#  rows = sequences in the two datasets identified by the respective identifier  # 
+def generate_FFP_dataframe(fileA, fileB, k=2):
+    familyA  = extract_map(fileA)
+    familyB  = extract_map(fileB)
+    kmers = get_all_kmers(k)
+    dataframe = pandas.DataFrame(columns = kmers + ["Class"])
+    for identifier in familyA:
+        FFP = get_kmers_frequency(familyA[identifier], k)
+        FFP["Class"] = 1
+        dataframe.loc[identifier] = pandas.Series(FFP)
+    for identifier in familyB:
+        FFP = get_kmers_frequency(familyB[identifier], k)
+        FFP["Class"] = 0
+        dataframe.loc[identifier] = pandas.Series(FFP)
+    dataframe = dataframe.fillna(0)
+    dataframe['Class'] = dataframe['Class'].astype(int)
+    return dataframe
 
-def generate_FFP_df(file_name_1,file_name_2, k):
-    """
-    Creates and fills a pandas dataframe, with the FFP values for all the sequences in both input files. 
-    The columns should have the 400 Fi,j dinucleotide values while the rows should correspond to 
-    each sequences in the two datasets identified by the respective sequence id.
-    """
-
-    fam1= read_Fasta(file_name_1)
-    fam2= read_Fasta(file_name_2)
-
-    mers= word_to_kmer(k)
-
-    df = pd.DataFrame(columns=mers+ ["Class"])
-
-    for id in fam1:
-        FFP=generate_kmers(fam1[id],k)
-        FFP["Class"]=1
-        df.loc[id] = pd.Series(FFP)
-
-
-    for id in fam2:
-        FFP=generate_kmers(fam2[id],k)
-        FFP["Class"]=0
-        df.loc[id] = pd.Series(FFP)
-
-    df = df.fillna(0)
-    df['Class'] = df['Class'].astype(int)
-    
-    return df
-
-
-def classification(df):
-    """
-    Apply 3 Machine Learning algorithms to predict if the type of the protein 
-    - methods: Random Forests, SVM, NaiveBayes
-    - metrics:  accuracy, recall, precision, F1-score
-    - Stratified 10-fold cross-validation 
-    Return a dataframe with the average and standard deviation across the 10 folds of all the metrics of all the methods
-    """
-     
-    # Split the dataframe in features and target (protein class)
-    X = df.iloc[:, :-1] 
-    y = df['Class']     
-
-    # Create a cross-validation object (Stratified 10-fold)
-    scv = StratifiedKFold(n_splits=10, shuffle=True, random_state=23)
-
-    # Define the metrics
-    scoring = ['accuracy', 'recall', 'precision', 'f1']
-
-    # Define a dataframe for storing the scores
-    scores_df= pd.DataFrame()
-
-    # Random Forest 
-    rforest_model = RandomForestClassifier() 
-    rforest_results = cross_validate(rforest_model, X, y, cv=scv, scoring=scoring, return_train_score=False)
-
-    rforest_scores={
-        "mean_accuracy" : np.mean(rforest_results['test_accuracy']),
-        "mean_recall" : np.mean(rforest_results['test_recall']),
-        "mean_precision" : np.mean(rforest_results['test_precision']),
-        "mean_f1" : np.mean(rforest_results['test_f1']),
-        "std_accuracy" : np.std(rforest_results['test_accuracy']),
-        "std_recall" : np.std(rforest_results['test_recall']),
-        "std_precision" :np.std(rforest_results['test_precision']),
-        "std_f1" : np.std(rforest_results['test_f1'])        
-        }
-
-    new_row = pd.DataFrame(rforest_scores, index=["Random Forest"])
-    scores_df = pd.concat([scores_df, new_row])
-
-    # SVM
-    svm_model = SVC()
-    svm_results = cross_validate(svm_model, X, y, cv=scv, scoring=scoring, return_train_score=False)
-
-    svm_scores = {
-        "mean_accuracy" : np.mean(svm_results['test_accuracy']),
-        "mean_recall" : np.mean(svm_results['test_recall']),
-        "mean_precision" : np.mean(svm_results['test_precision']),
-        "mean_f1" : np.mean(svm_results['test_f1']),
-        "std_accuracy" : np.std(svm_results['test_accuracy']),
-        "std_recall" : np.std(svm_results['test_recall']),
-        "std_precision" :np.std(svm_results['test_precision']),
-        "std_f1" : np.std(svm_results['test_f1'])        
+# Applies Random Forests, SVM and NaiveBayes in order to predict the type of protein #
+#                   metrics: accuracy, recall, precision, F1-score                   #
+#                        Stratified 10-fold cross-validation                         # 
+def classification(dataframe):
+    import numpy
+    from   sklearn.ensemble         import RandomForestClassifier
+    from   sklearn.svm              import SVC
+    from   sklearn.naive_bayes      import GaussianNB
+    from   sklearn.model_selection  import StratifiedKFold, cross_validate
+    from   sklearn.metrics          import accuracy_score, recall_score, precision_score, f1_score
+    # Split the dataframe in features and target (protein class) #
+    x   = dataframe.iloc[:,:-1]
+    y   = dataframe['Class']     
+    scv = StratifiedKFold(n_splits=10, shuffle=True, random_state=23)   # cross-validation object (Stratified 10-fold)
+    scoring = ['accuracy', 'recall', 'precision', 'f1']                 # metrics
+    scores_dataframe= pandas.DataFrame()                                # dataframe for storing the scores
+    # Random Forest #
+    rforest_model   = RandomForestClassifier() 
+    rforest_results = cross_validate(rforest_model, x, y, cv=scv, scoring=scoring, return_train_score=False)
+    rforest_scores  = {
+        "mean_accuracy"     : numpy.mean(rforest_results['test_accuracy']),
+        "mean_recall"       : numpy.mean(rforest_results['test_recall']),
+        "mean_precision"    : numpy.mean(rforest_results['test_precision']),
+        "mean_f1"           : numpy.mean(rforest_results['test_f1']),
+        "std_accuracy"      : numpy.std (rforest_results['test_accuracy']),
+        "std_recall"        : numpy.std (rforest_results['test_recall']),
+        "std_precision"     : numpy.std (rforest_results['test_precision']),
+        "std_f1"            : numpy.std (rforest_results['test_f1'])        
     }
-
-    new_row = pd.DataFrame(svm_scores, index=["SVM"])
-    scores_df = pd.concat([scores_df, new_row])
-
-    # Naive Bayes
-    nb_model = GaussianNB()
-    nb_results = cross_validate(nb_model, X, y, cv=scv, scoring=scoring, return_train_score=False)
-
+    new_row = pandas.DataFrame(rforest_scores, index=["Random Forest"])
+    scores_dataframe = pandas.concat([scores_dataframe, new_row])
+    # SVM #
+    svm_model   = SVC()
+    svm_results = cross_validate(svm_model, x, y, cv=scv, scoring=scoring, return_train_score=False)
+    svm_scores  = {
+        "mean_accuracy"     : numpy.mean(svm_results['test_accuracy']),
+        "mean_recall"       : numpy.mean(svm_results['test_recall']),
+        "mean_precision"    : numpy.mean(svm_results['test_precision']),
+        "mean_f1"           : numpy.mean(svm_results['test_f1']),
+        "std_accuracy"      : numpy.std (svm_results['test_accuracy']),
+        "std_recall"        : numpy.std (svm_results['test_recall']),
+        "std_precision"     : numpy.std (svm_results['test_precision']),
+        "std_f1"            : numpy.std (svm_results['test_f1'])        
+    }
+    new_row = pandas.DataFrame(svm_scores, index=["SVM"])
+    scores_dataframe = pandas.concat([scores_dataframe, new_row])
+    # Naive Bayes #
+    nb_model   = GaussianNB()
+    nb_results = cross_validate(nb_model, x, y, cv=scv, scoring=scoring, return_train_score=False)
     nb_scores = {
-        "mean_accuracy" : np.mean(nb_results['test_accuracy']),
-        "mean_recall" : np.mean(nb_results['test_recall']),
-        "mean_precision" : np.mean(nb_results['test_precision']),
-        "mean_f1" : np.mean(nb_results['test_f1']),
-        "std_accuracy" : np.std(nb_results['test_accuracy']),
-        "std_recall" : np.std(nb_results['test_recall']),
-        "std_precision" : np.std(nb_results['test_precision']),
-        "std_f1" : np.std(nb_results['test_f1'])        
+        "mean_accuracy"     : numpy.mean(nb_results['test_accuracy']),
+        "mean_recall"       : numpy.mean(nb_results['test_recall']),
+        "mean_precision"    : numpy.mean(nb_results['test_precision']),
+        "mean_f1"           : numpy.mean(nb_results['test_f1']),
+        "std_accuracy"      : numpy.std (nb_results['test_accuracy']),
+        "std_recall"        : numpy.std (nb_results['test_recall']),
+        "std_precision"     : numpy.std (nb_results['test_precision']),
+        "std_f1"            : numpy.std (nb_results['test_f1'])        
     }
+    new_row = pandas.DataFrame(nb_scores, index=["Naive Bayes"])
+    scores_dataframe = pandas.concat([scores_dataframe, new_row])
+    return scores_dataframe
 
-    new_row = pd.DataFrame(nb_scores, index=["Naive Bayes"])
-    scores_df = pd.concat([scores_df, new_row])
-   
-    return(scores_df)
+# program's flow controller "
+def main(arguments):
+    (fileA,fileB,k) = parseArguments(arguments)
+    dataframe       = generate_FFP_dataframe(fileA,fileB,k)
+    print(f"FFP Values:\n{dataframe}")
+    output_file = open('FFP_Values.txt', 'w')
+    print(f"FFP Values:\n{dataframe.to_string()}", file=output_file)
+    output_file.close()
+    classification_scores = classification(dataframe)
+    print(f"Classification:\n{classification_scores}")
+    return
 
-
-
-
-def main():
-
-    for i in range(1,len(sys.argv),2):
-        if sys.argv[i]=="-a":
-            file_name_1 = sys.argv[i+1]
-        elif sys.argv[i]=="-b":
-            file_name_2 = sys.argv[i+1]
-        elif sys.argv[i]=="-k":
-            k= int(sys.argv[i+1])
-    
-             
-    dataframe=generate_FFP_df(file_name_1,file_name_2, k)
-    print("FFP VALUES")
-    print(dataframe)
-    with open('FFP_VALUES.txt', 'w') as f:
-        print('FFP VALUES:\n', dataframe.to_string(), file=f)
-    
-    classification_scores=classification(dataframe)
-    print("CLASSIFICATION")
-    print(classification_scores)
-
-
-
-main()
+from sys import argv
+if __name__ == "__main__": main(argv)
